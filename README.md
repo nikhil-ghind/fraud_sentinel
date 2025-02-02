@@ -2,6 +2,46 @@
 
 LSTM Autoencoder for financial transaction anomaly detection. Trains on normal transaction sequences, detects anomalies via reconstruction error threshold with ≥94% recall. Deployed as a FastAPI microservice.
 
+## Architecture
+
+```mermaid
+flowchart TB
+    CSV["raw transactions CSV<br/>data/generate_sample.py for synthetic data"] --> FE["load_and_engineer<br/>hour, day_of_week, days_since_last per account"]
+    FE --> SC["StandardScaler fit on training rows<br/>saved to checkpoints for serving"]
+    SC --> SEQ["make_sequences<br/>sliding window of seq_len steps per account,<br/>label = any fraud inside the window"]
+
+    subgraph train["Training — src/train.py (normal windows only)"]
+        SEQ --> SPL["split_normal_anomaly"]
+        SPL --> NRM["normal sequences"]
+        NRM --> DL["train / val DataLoaders"]
+        DL --> AE["LSTMAutoencoder<br/>encoder LSTM to (h_n, c_n),<br/>decoder LSTM repeated seq_len steps + Linear head"]
+        AE --> LOSS["MSE reconstruction loss, Adam"]
+        LOSS --> ES["EarlyStopping on val loss<br/>best state_dict written to checkpoint_path"]
+    end
+
+    subgraph cal["Calibration — src/threshold.py"]
+        SPL --> ANM["anomaly sequences"]
+        ES --> ERR["compute_reconstruction_errors<br/>per-sequence MSE"]
+        NRM --> ERR
+        ANM --> ERR
+        ERR --> SWEEP["sweep_thresholds<br/>percentiles 90 to 99.5 in 0.5 steps"]
+        SWEEP --> PICK["pick the lowest threshold with recall >= 0.94,<br/>else fall back to the first row"]
+        PICK --> TJ["checkpoints/threshold.json<br/>tau, percentile, recall, precision"]
+    end
+
+    subgraph serve["Serving — api/"]
+        LIFE["lifespan: inference.load_artifacts<br/>state_dict + scaler + threshold.json"]
+        SCORE["POST /score and POST /score/batch"]
+        SCORE --> ISEQ["rebuild features, scale, window"]
+        ISEQ --> IREC["forward pass, MSE against the input"]
+        IREC --> FLAG["is_fraud = error > tau"]
+        HEALTH["GET /health reports model_loaded"]
+    end
+    ES --> LIFE
+    SC --> LIFE
+    TJ --> LIFE
+```
+
 ## Overview
 
 - **LSTM Autoencoder**: Encoder (2-layer LSTM) → Decoder (2-layer LSTM) → reconstruction MSE
@@ -40,19 +80,6 @@ curl -X POST http://localhost:8001/score \
 
 # Tests
 pytest tests/ -v
-```
-
-## Architecture
-
-```
-Raw transactions (CSV)
-    → feature engineering (hour, day_of_week, days_since_last)
-    → StandardScaler normalization
-    → sliding window sequences (T=30, F=6)
-    → LSTM Encoder → (h, c)
-    → LSTM Decoder → reconstructed sequence
-    → MSE anomaly score
-    → threshold τ (99th percentile of train errors) → binary flag
 ```
 
 ## Evaluation
